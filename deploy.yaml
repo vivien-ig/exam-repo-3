@@ -1,0 +1,186 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Workflow using Step Functions, Glue, SQS and SNS.
+
+Parameters:
+  GlueScriptLocation:
+    Type: String
+    Description: >
+      S3 URI of the Glue PySpark script, for example
+      s3://my-bucket/scripts/process_data.py
+
+  GlueTempDirectory:
+    Type: String
+    Description: >
+      S3 URI for Glue temporary files, for example
+      s3://metroc-terraform-state-1/temp/
+
+Resources:
+
+  # 1. SQS Queue
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: exam-processing-queue
+      VisibilityTimeout: 60
+
+  # 2. SNS Topic
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: exam-notification-topic
+
+  # 3. IAM Role for AWS Glue
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+      Policies:
+        - PolicyName: GlueS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: '*'
+
+  # 4. AWS Glue Job
+  DataProcessingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: exam-data-processing-job
+      Role: !GetAtt GlueExecutionRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Command:
+        Name: glueetl
+        ScriptLocation: !Ref GlueScriptLocation
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--TempDir': !Ref GlueTempDirectory
+        '--enable-metrics': 'true'
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  # 5. IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: WorkflowServiceAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow Step Functions to start and monitor Glue
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: '*'
+
+              # Allow sending messages to SQS
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ProcessingQueue.Arn
+
+              # Allow publishing notifications to SNS
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # 6. Step Functions State Machine
+  DataProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: exam-data-processing-workflow
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+      DefinitionString: !Sub |
+        {
+          "Comment": "Glue, SQS and SNS workflow",
+          "StartAt": "Start",
+          "States": {
+            "Start": {
+              "Type": "Pass",
+              "Next": "RunGlueJob"
+            },
+            "RunGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DataProcessingJob}"
+              },
+              "Next": "SendSQSMessage"
+            },
+            "SendSQSMessage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${ProcessingQueue}",
+                "MessageBody.$": "States.JsonToString($)"
+              },
+              "Next": "PublishSNSNotification"
+            },
+            "PublishSNSNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Message.$": "States.JsonToString($)",
+                "Subject": "Glue Job Completed"
+              },
+              "Next": "Stop"
+            },
+            "Stop": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+Outputs:
+
+  StateMachineArn:
+    Description: ARN of the Step Functions workflow
+    Value: !Ref DataProcessingStateMachine
+
+  GlueJobName:
+    Description: Name of the Glue job
+    Value: !Ref DataProcessingJob
+
+  SQSQueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref ProcessingQueue
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic
+    Value: !Ref NotificationTopic
